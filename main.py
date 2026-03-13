@@ -1,79 +1,71 @@
-import pandas as pd
 from fastapi import FastAPI, Depends
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy import create_engine, Column, Integer, Float, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
-from datetime import datetime, timezone 
+from datetime import datetime, timezone
 import os
 
-# DATABASE CORE
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./can_raw.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# --- CONFIGURATION ---
+DATABASE_URL = "sqlite:///./ebike_training.db"
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# MODÈLE UNIQUE (Optimisé pour IA)
-class RawCan(Base):
-    __tablename__ = "raw_can"
-    id        = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True) # Index pour les séries temporelles
-    can_id    = Column(String(10), index=True)
-    valeur    = Column(String(50))
+vitesse_pedale = 0x0D2
+vitesse_roue = 0x0D1
+SoC = 0x111
+couple = 0x206
+mode_actuel = 0x03B
+puissance = 0x0D4
+
+# --- MODÈLE SQL (Ton tableau d'entraînement) ---
+class Telemetry(Base):
+    __tablename__ = "telemetry"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    
+    vitesse_pedale = Column(Float)
+    vitesse_roue = Column(Float)
+    Soc = Column(Float)
+    couple = Column(Float)
+    mode_actuel = Column(Float)
+    puissance = Column(Float)
 
 Base.metadata.create_all(bind=engine)
+app = FastAPI()
 
-# --- API ---
-app = FastAPI(title="CAN Data Ingestor")
+# --- SCHÉMA DE RÉCEPTION ---
+class TelemetryIn(BaseModel):
+    vitesse_pedale: float
+    vitesse_roue: float
+    Soc: float
+    couple: float
+    mode_actuel: float
+    puissance: float
 
-def get_db():
+# --- ROUTE D'ENREGISTREMENT ---
+@app.post("/log")
+async def log_data(data: TelemetryIn):
     db = SessionLocal()
     try:
-        yield db
+        new_row = Telemetry(
+            vitesse_pedale=data.vitesse_pedale,
+            vitesse_roue=data.vitesse_roue,
+            Soc=data.Soc,
+            couple=data.couple,
+            mode_actuel=data.mode_actuel,
+            puissance=data.puissance
+        )
+        db.add(new_row)
+        db.commit()
     finally:
         db.close()
+    return {"status": "saved"}
 
-class CanEntry(BaseModel):
-    id: str
-    val: str
-
-@app.post("/ingest")
-async def ingest_can(data: CanEntry, db: Session = Depends(get_db)):
-    """Route ultra-rapide pour l'ESP32/iPhone"""
-    new_frame = RawCan(can_id=data.id, valeur=data.val)
-    db.add(new_frame)
-    db.commit()
-    return {"s": 1} # Réponse minimale pour gagner de la bande passante
-
+# --- ROUTE POUR RÉCUPÉRER TOUT LE TABLEAU (IA) ---
 @app.get("/export")
-def get_all(db: Session = Depends(get_db)):
-    """Récupère tout pour ton IA"""
-    return db.query(RawCan).all()
-
-@app.get("/data-for-ai")
-def get_ai_table():
+def export_data():
     db = SessionLocal()
-    # 1. Charger les données brutes
-    query = db.query(RawCan).all()
+    data = db.query(Telemetry).all()
     db.close()
-    
-    if not query:
-        return {"error": "no data"}
-
-    # 2. Utiliser Pandas pour transformer le vrac en tableau propre
-    df = pd.DataFrame([{
-        'timestamp': r.timestamp, 
-        'can_id': r.can_id, 
-        'valeur': r.valeur
-    } for r in query])
-
-    # 3. Le Pivot : On transforme les lignes d'ID en colonnes
-    # On regroupe par timestamp et on déploie les can_id en colonnes
-    pivot_df = df.pivot(index='timestamp', columns='can_id', values='valeur')
-    
-    # 4. Nettoyage (optionnel : remplir les trous par la dernière valeur connue)
-    pivot_df = pivot_df.ffill() 
-
-    return pivot_df.reset_index().to_dict(orient="records")
+    return data
